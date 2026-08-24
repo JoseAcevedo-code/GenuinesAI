@@ -6,6 +6,7 @@ import { cleanText, decodeEntities, dedupeSentences, truncateOnWord } from "../l
 import {
   findRepeatedPhrase,
   hasNewsIntent,
+  SOCIAL_INTENT,
   overlapsQuery,
   queryFromPrompt,
   resolveFollowUp,
@@ -13,7 +14,15 @@ import {
   topicFromNewsPrompt,
 } from "../lib/search/intent.ts";
 import { localResponse, repetitionResponse } from "../lib/search/conversation.ts";
-import { parseFeedItems, rankNews, sortByRecency, summarizeExtract } from "../lib/search/providers.ts";
+import {
+  parseBlueskyResults,
+  parseFeedItems,
+  parseMastodonResults,
+  parseRedditResults,
+  rankNews,
+  sortByRecency,
+  summarizeExtract,
+} from "../lib/search/providers.ts";
 import { checkRateLimit } from "../lib/search/rate-limit.ts";
 import { MIN_RELEVANCE, newsRank, recencyWeight, relevanceScore } from "../lib/search/relevance.ts";
 import { readCache, writeCache } from "../lib/search/cache.ts";
@@ -54,6 +63,12 @@ test("hasNewsIntent separates live-news prompts from static questions", () => {
   assert.equal(hasNewsIntent("what are today's headlines"), true);
   assert.equal(hasNewsIntent("the current president of France"), true);
   assert.equal(hasNewsIntent("how does photosynthesis work"), false);
+});
+
+test("SOCIAL_INTENT recognises platform names and public-reaction wording", () => {
+  assert.equal(SOCIAL_INTENT.test("What are people saying about this on Reddit?"), true);
+  assert.equal(SOCIAL_INTENT.test("Search the public reaction on Bluesky"), true);
+  assert.equal(SOCIAL_INTENT.test("Explain photosynthesis"), false);
 });
 
 test("queryFromPrompt strips the request framing around the topic", () => {
@@ -152,12 +167,65 @@ test("answers the prompts that reached the live site as connection errors", () =
 });
 
 test("resolveModel only accepts catalogued models", () => {
-  assert.equal(resolveModel("GenuinesAI Reason").resultLimit, 6);
-  assert.equal(resolveModel("GenuinesAI Fast").resultLimit, 3);
+  assert.equal(resolveModel("GenuinesAI Reason").apiModel, "gpt-5.6-sol");
+  assert.equal(resolveModel("GenuinesAI Fast").apiModel, "gpt-5.6-luna");
+  assert.equal(resolveModel("GenuinesAI Pro").apiModel, "gpt-5.6-terra");
   // A loose substring match previously let any string containing "Reason" win.
   assert.equal(resolveModel("Reasonably evil model").name, DEFAULT_MODEL.name);
   assert.equal(resolveModel(undefined).name, DEFAULT_MODEL.name);
   assert.equal(resolveModel({ name: "GenuinesAI Fast" }).name, DEFAULT_MODEL.name);
+});
+
+test("link posts get no snippet, so the relevance gate still applies", () => {
+  // A placeholder naming the query used to be written into the snippet, which is
+  // the text relevanceScore reads — every link post then cleared MIN_RELEVANCE
+  // regardless of how unrelated its title was.
+  const [post] = parseRedditResults({
+    data: { children: [{ data: {
+      title: "Cat pictures thread",
+      selftext: "",
+      subreddit_name_prefixed: "r/cats",
+      permalink: "/r/cats/comments/xyz/cat_pictures/",
+      created_utc: 1_700_000_000,
+    } }] },
+  });
+
+  assert.equal(post.snippet, "");
+  assert.ok(
+    relevanceScore("quantum computing breakthrough", post.title, post.snippet) < MIN_RELEVANCE,
+    "an unrelated link post must not clear the relevance gate",
+  );
+});
+
+test("public social payload parsers produce safe, clickable sources", () => {
+  const reddit = parseRedditResults({
+    data: { children: [{ data: {
+      title: "AI launch discussion",
+      selftext: "People are comparing the new release.",
+      subreddit_name_prefixed: "r/artificial",
+      permalink: "/r/artificial/comments/abc/ai_launch/",
+      created_utc: 1_700_000_000,
+    } }] },
+  });
+  assert.equal(reddit[0].source, "Reddit · r/artificial");
+  assert.match(reddit[0].url, /^https:\/\/www\.reddit\.com\//);
+
+  const bluesky = parseBlueskyResults({ posts: [{
+    uri: "at://did:plc:example/app.bsky.feed.post/xyz",
+    indexedAt: "2026-08-24T12:00:00.000Z",
+    author: { handle: "jose.example", displayName: "Jose" },
+    record: { text: "Testing a thoughtful AI update" },
+  }] }, "AI update");
+  assert.equal(bluesky[0].source, "Bluesky · @jose.example");
+  assert.match(bluesky[0].url, /bsky\.app\/profile\/jose\.example\/post\/xyz$/);
+
+  const mastodon = parseMastodonResults({ statuses: [{
+    url: "https://mastodon.social/@jose/123",
+    content: "<p>A public reaction &amp; source.</p>",
+    created_at: "2026-08-24T12:00:00.000Z",
+    account: { acct: "jose@mastodon.social", display_name: "Jose" },
+  }] }, "public reaction");
+  assert.equal(mastodon[0].snippet, "A public reaction & source.");
 });
 
 test("parseFeedItems reads CDATA, dedupes, and rejects non-https links", () => {

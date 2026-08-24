@@ -2,7 +2,7 @@
 
 import { USER_AGENT } from "../branding.ts";
 import { readCache, writeCache } from "./cache.ts";
-import { MIN_RELEVANCE, newsRank, relevanceScore } from "./relevance.ts";
+import { MIN_RELEVANCE, newsRank, recencyWeight, relevanceScore } from "./relevance.ts";
 import { cleanText, dedupeSentences, truncateOnWord } from "./text.ts";
 import { queryFromPrompt, topicFromNewsPrompt } from "./intent.ts";
 
@@ -25,6 +25,38 @@ type WikipediaPage = {
 type WikipediaSummary = {
   title?: string;
   extract?: string;
+};
+
+type RedditPayload = {
+  data?: {
+    children?: Array<{
+      data?: {
+        title?: string;
+        selftext?: string;
+        subreddit_name_prefixed?: string;
+        permalink?: string;
+        created_utc?: number;
+      };
+    }>;
+  };
+};
+
+type BlueskyPayload = {
+  posts?: Array<{
+    uri?: string;
+    indexedAt?: string;
+    author?: { handle?: string; displayName?: string };
+    record?: { text?: string };
+  }>;
+};
+
+type MastodonPayload = {
+  statuses?: Array<{
+    url?: string;
+    content?: string;
+    created_at?: string;
+    account?: { acct?: string; display_name?: string };
+  }>;
 };
 
 /**
@@ -248,6 +280,122 @@ export async function wikipediaSummary(key?: string): Promise<string> {
     console.error("[search] wikipedia summary failed:", error);
     return "";
   }
+}
+
+function socialQuery(prompt: string): string {
+  return queryFromPrompt(prompt)
+    .replace(/\b(?:social media|socials?|reddit|bluesky|bsky|twitter|x\.com|tiktok|instagram|threads|youtube|mastodon)\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim() || queryFromPrompt(prompt) || truncateOnWord(prompt, 140);
+}
+
+/** Converts Reddit's public search payload into the same source shape as news. */
+export function parseRedditResults(payload: RedditPayload): SearchSource[] {
+  return (payload.data?.children ?? []).flatMap((child): SearchSource[] => {
+    const post = child.data;
+    if (!post) return [];
+    const title = cleanText(post.title ?? "");
+    const permalink = post.permalink;
+    if (!title || !permalink?.startsWith("/")) return [];
+
+    const publishedAt = typeof post.created_utc === "number"
+      ? new Date(post.created_utc * 1000).toISOString()
+      : undefined;
+    return [{
+      title,
+      url: `https://www.reddit.com${permalink}`,
+      // Link posts carry no body. An empty snippet keeps relevance scoring honest;
+      // a placeholder naming the query would echo it back into the filter below.
+      snippet: truncateOnWord(cleanText(post.selftext ?? ""), 280),
+      source: `Reddit${post.subreddit_name_prefixed ? ` · ${post.subreddit_name_prefixed}` : ""}`,
+      publishedAt,
+    }];
+  });
+}
+
+/** Converts Bluesky's public appview search response into clickable post URLs. */
+export function parseBlueskyResults(payload: BlueskyPayload, query: string): SearchSource[] {
+  return (payload.posts ?? []).flatMap((post): SearchSource[] => {
+    const handle = post.author?.handle;
+    const rkey = post.uri?.split("/").at(-1);
+    const text = cleanText(post.record?.text ?? "");
+    if (!handle || !rkey || !text) return [];
+    const author = cleanText(post.author?.displayName || `@${handle}`);
+    return [{
+      title: truncateOnWord(`${author}: ${text}`, 120),
+      url: `https://bsky.app/profile/${encodeURIComponent(handle)}/post/${encodeURIComponent(rkey)}`,
+      snippet: truncateOnWord(text || `Public post matching “${query}”.`, 280),
+      source: `Bluesky · @${handle}`,
+      publishedAt: post.indexedAt,
+    }];
+  });
+}
+
+export function parseMastodonResults(payload: MastodonPayload, query: string): SearchSource[] {
+  return (payload.statuses ?? []).flatMap((status): SearchSource[] => {
+    const text = cleanText(status.content ?? "");
+    if (!status.url?.startsWith("https://") || !text) return [];
+    const account = cleanText(status.account?.display_name || status.account?.acct || "Mastodon user");
+    return [{
+      title: truncateOnWord(`${account}: ${text}`, 120),
+      url: status.url,
+      snippet: truncateOnWord(text || `Public post matching “${query}”.`, 280),
+      source: `Mastodon${status.account?.acct ? ` · @${status.account.acct}` : ""}`,
+      publishedAt: status.created_at,
+    }];
+  });
+}
+
+/**
+ * Searches keyless public social APIs. These posts are useful evidence of what
+ * people are saying, never proof that the underlying claim is true. The AI
+ * route receives that distinction in its system instructions.
+ */
+export async function searchSocialMedia(prompt: string, limit: number): Promise<SearchSource[]> {
+  const query = socialQuery(prompt);
+  if (!query) return [];
+
+  const redditUrl = new URL("https://www.reddit.com/search.json");
+  redditUrl.searchParams.set("q", query);
+  redditUrl.searchParams.set("sort", "relevance");
+  redditUrl.searchParams.set("t", "month");
+  redditUrl.searchParams.set("limit", String(Math.min(Math.max(limit * 2, 8), 24)));
+  redditUrl.searchParams.set("type", "link");
+
+  const blueskyUrl = new URL("https://public.api.bsky.app/xrpc/app.bsky.feed.searchPosts");
+  blueskyUrl.searchParams.set("q", query);
+  blueskyUrl.searchParams.set("sort", "latest");
+  blueskyUrl.searchParams.set("limit", String(Math.min(Math.max(limit * 2, 8), 25)));
+
+  const mastodonUrl = new URL("https://mastodon.social/api/v2/search");
+  mastodonUrl.searchParams.set("q", query);
+  mastodonUrl.searchParams.set("type", "statuses");
+  mastodonUrl.searchParams.set("limit", String(Math.min(Math.max(limit, 5), 20)));
+  mastodonUrl.searchParams.set("resolve", "false");
+
+  const responses = await Promise.allSettled([
+    fetchJson(redditUrl, 7000, "Reddit search").then((payload) => parseRedditResults(payload as RedditPayload)),
+    fetchJson(blueskyUrl, 7000, "Bluesky search").then((payload) => parseBlueskyResults(payload as BlueskyPayload, query)),
+    fetchJson(mastodonUrl, 7000, "Mastodon search").then((payload) => parseMastodonResults(payload as MastodonPayload, query)),
+  ]);
+
+  const sources = responses.flatMap((response) => {
+    if (response.status === "fulfilled") return response.value;
+    console.error("[search] social provider failed:", response.reason);
+    return [];
+  });
+
+  const now = Date.now();
+  return sources
+    .map((source) => ({
+      source,
+      score: relevanceScore(query, source.title, source.snippet)
+        + recencyWeight(source.publishedAt, now) * 0.35,
+    }))
+    .filter(({ source }) => relevanceScore(query, source.title, source.snippet) >= MIN_RELEVANCE)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
+    .map(({ source }) => source);
 }
 
 /** Exported for tests: trims an extract to at most three sentences / 650 chars. */

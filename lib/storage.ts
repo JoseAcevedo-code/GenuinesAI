@@ -12,4 +12,4 @@ export const STORAGE_KEYS = {
 } as const;
 
 /** Bumped whenever a stored transcript is no longer readable by this build. */
-export const STORAGE_VERSION = "intent-router-v3";
+export const STORAGE_VERSION = "ai-chat-v1";

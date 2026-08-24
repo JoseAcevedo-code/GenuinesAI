@@ -15,6 +15,7 @@ export const MAX_HISTORY_CONTENT_LENGTH = 500;
 export const STRONG_NEWS_INTENT = /\b(news|breaking|headlines|current events?|what happened|what's happening|updates?)\b/i;
 export const TIME_SENSITIVE_INTENT = /\b(today(?:['’]s)?|latest|recent|right now)\b/i;
 export const SEARCH_INTENT = /\b(search(?: the)? web|search for|look up|find online|on the web|web search|check online)\b/i;
+export const SOCIAL_INTENT = /\b(social media|socials?|reddit|subreddit|bluesky|bsky|twitter|x\.com|tweets?|tiktok|instagram|threads(?:\.net)?|youtube|mastodon|people (?:are )?saying|online reactions?|public reactions?|trending posts?)\b/i;
 export const GREETING = /^(hi|hello|hey|yo|good morning|good afternoon|good evening)[!. ]*$/i;
 export const KNOWLEDGE_INTENT = /^(who|what|where|when|why|how|which|is|are|was|were|do|does|did|can|could|should|would|will)\b|^(tell me about|explain|teach me about|i want to know about)\b/i;
 export const FOLLOW_UP = /^(tell me more|more details|go deeper|keep going|continue|expand on that|what about (that|it)|how so|why|and why)[?!. ]*$/i;
