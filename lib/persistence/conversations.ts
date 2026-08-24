@@ -243,6 +243,26 @@ export async function saveExchange(options: {
   return { userMessageId, assistantMessageId };
 }
 
+/**
+ * Removes the most recent user+assistant pair from a conversation.
+ *
+ * Regeneration replaces the last answer rather than appending a second one. The
+ * ownership check lives in the `conversation_id IN (...)` clause so a caller
+ * cannot delete from a conversation it does not own, and the inner SELECT keeps
+ * this portable — SQLite only supports `DELETE ... LIMIT` on custom builds.
+ */
+export async function dropLastExchange(ownerEmail: string, conversationId: string): Promise<void> {
+  await ensureConversationSchema();
+  const db = database();
+  await db.prepare(`DELETE FROM messages
+      WHERE id IN (
+        SELECT id FROM messages WHERE conversation_id = ? ORDER BY created_at DESC LIMIT 2
+      )
+      AND conversation_id IN (SELECT id FROM conversations WHERE id = ? AND owner_email = ?)`)
+    .bind(conversationId, conversationId, ownerEmail)
+    .run();
+}
+
 export async function saveAttachmentMetadata(options: {
   ownerEmail: string;
   conversationId: string;

@@ -123,7 +123,7 @@ function createUserContent(prompt: string, file?: AiFileInput, socialSources: Se
     ];
   }
   return [
-    { type: "input_file", filename: file.name, file_data: dataUrl, detail: file.type === "application/pdf" ? "auto" : undefined },
+    { type: "input_file", filename: file.name, file_data: dataUrl },
     { type: "input_text", text },
   ];
 }
@@ -131,7 +131,8 @@ function createUserContent(prompt: string, file?: AiFileInput, socialSources: Se
 function parseResponse(payload: RawResponse, socialRequested: boolean, hasFile: boolean): AiResponseResult {
   let answer = "";
   const citations: AnswerCitation[] = [];
-  const discoveredSources: SearchSource[] = [];
+  const citedSources: SearchSource[] = [];
+  const searchSources: SearchSource[] = [];
   let searchedWeb = false;
 
   for (const item of payload.output ?? []) {
@@ -140,7 +141,7 @@ function parseResponse(payload: RawResponse, socialRequested: boolean, hasFile: 
       for (const source of item.action?.sources ?? []) {
         const url = safeHttpsUrl(source.url);
         if (!url) continue;
-        discoveredSources.push({
+        searchSources.push({
           title: source.title?.trim() || sourceLabel(url),
           url,
           snippet: "Source consulted during live web search.",
@@ -169,7 +170,7 @@ function parseResponse(payload: RawResponse, socialRequested: boolean, hasFile: 
           url,
           title: annotation.title?.trim() || sourceLabel(url),
         });
-        discoveredSources.push({
+        citedSources.push({
           title: annotation.title?.trim() || sourceLabel(url),
           url,
           snippet: "Cited in the answer.",
@@ -179,7 +180,7 @@ function parseResponse(payload: RawResponse, socialRequested: boolean, hasFile: 
     }
   }
 
-  const sources = [...new Map(discoveredSources.map((source) => [source.url, source])).values()];
+  const sources = [...new Map([...citedSources, ...searchSources].map((source) => [source.url, source])).values()];
   if (!answer.trim()) {
     throw new OpenAIRequestError(
       "OpenAI returned no output text",
@@ -188,9 +189,19 @@ function parseResponse(payload: RawResponse, socialRequested: boolean, hasFile: 
     );
   }
 
+  const trimmedAnswer = answer.trim();
+  const leadingTrimmed = answer.length - answer.trimStart().length;
+  const adjustedCitations = citations
+    .map((citation) => ({
+      ...citation,
+      startIndex: citation.startIndex - leadingTrimmed,
+      endIndex: Math.min(citation.endIndex - leadingTrimmed, trimmedAnswer.length),
+    }))
+    .filter((citation) => citation.startIndex >= 0 && citation.endIndex > citation.startIndex);
+
   return {
-    answer: answer.trim(),
-    citations,
+    answer: trimmedAnswer,
+    citations: adjustedCitations,
     sources,
     mode: socialRequested ? "social" : hasFile ? "file" : searchedWeb ? "web" : "conversation",
     responseId: payload.id,

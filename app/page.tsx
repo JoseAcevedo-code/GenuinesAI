@@ -234,6 +234,14 @@ function createMessageId(): string {
   return `m${Date.now().toString(36)}-${messageSequence}`;
 }
 
+/** A stored transcript entry is only usable if the fields the UI reads are present. */
+function isStoredMessage(value: unknown): value is Message {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Partial<Message>;
+  return typeof candidate.content === "string"
+    && (candidate.role === "user" || candidate.role === "assistant");
+}
+
 function readStoredValue(key: string): string | null {
   try {
     return window.localStorage.getItem(key);
@@ -355,6 +363,7 @@ export default function Home() {
   useEffect(() => {
     const storageVersion = readStoredValue(STORAGE_KEYS.version);
     const savedMessages = readStoredValue(STORAGE_KEYS.messages);
+    const savedConversationId = readStoredValue(STORAGE_KEYS.conversationId);
     const savedModel = readStoredValue(STORAGE_KEYS.model);
     const savedTheme = readStoredValue(STORAGE_KEYS.theme);
 
@@ -362,8 +371,11 @@ export default function Home() {
       try {
         const parsed = JSON.parse(savedMessages) as unknown;
         // A hand-edited or half-written entry must not take the whole app down.
-        if (Array.isArray(parsed)) setMessages(parsed as Message[]);
-        else removeStoredValue(STORAGE_KEYS.messages);
+        const restored = Array.isArray(parsed) ? (parsed as unknown[]).filter(isStoredMessage) : null;
+        if (restored?.length) {
+          setMessages(restored);
+          if (savedConversationId) setActiveConversationId(savedConversationId);
+        } else removeStoredValue(STORAGE_KEYS.messages);
       } catch {
         removeStoredValue(STORAGE_KEYS.messages);
       }
@@ -396,11 +408,12 @@ export default function Home() {
   useEffect(() => {
     if (!hydrated) return;
     writeStoredValue(STORAGE_KEYS.messages, JSON.stringify(messages.slice(-MAX_PERSISTED_MESSAGES)));
+    writeStoredValue(STORAGE_KEYS.conversationId, activeConversationId ?? "");
     writeStoredValue(STORAGE_KEYS.version, STORAGE_VERSION);
     writeStoredValue(STORAGE_KEYS.model, selectedModel);
     writeStoredValue(STORAGE_KEYS.theme, theme);
     document.documentElement.dataset.theme = theme;
-  }, [messages, selectedModel, theme, hydrated]);
+  }, [messages, selectedModel, theme, activeConversationId, hydrated]);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: prefersReducedMotion() ? "auto" : "smooth" });
@@ -561,7 +574,7 @@ export default function Home() {
     }
   };
 
-  const requestAssistant = async (prompt: string, history: Message[], attachment?: File) => {
+  const requestAssistant = async (prompt: string, history: Message[], attachment?: File, regenerate = false) => {
     requestControllerRef.current?.abort();
     const controller = new AbortController();
     requestControllerRef.current = controller;
@@ -590,6 +603,7 @@ export default function Home() {
         form.set("model", selectedModel);
         form.set("history", JSON.stringify(requestHistory));
         if (activeConversationId) form.set("conversationId", activeConversationId);
+        if (regenerate) form.set("regenerate", "true");
         form.set("file", attachment);
         body = form;
       } else {
@@ -599,6 +613,7 @@ export default function Home() {
           model: selectedModel,
           history: requestHistory,
           conversationId: activeConversationId,
+          regenerate,
         });
       }
 
@@ -617,10 +632,12 @@ export default function Home() {
         searchedAt?: string;
         configurationRequired?: boolean;
         conversationId?: string;
+        conversationExpired?: boolean;
         saved?: boolean;
         provider?: "openai" | "fallback";
       };
       if (!response.ok) {
+        if (data.conversationExpired) setActiveConversationId(null);
         throw new Error(data.error || chatUnavailableMessage(response.status));
       }
 
@@ -716,7 +733,7 @@ export default function Home() {
     }
     const history = messages.slice(0, lastPromptIndex);
     setMessages(messages.slice(0, lastPromptIndex + 1));
-    void requestAssistant(lastPrompt.content, history);
+    void requestAssistant(lastPrompt.content, history, undefined, true);
   };
 
   const toggleVoiceInput = () => {

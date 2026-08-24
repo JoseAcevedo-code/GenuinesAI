@@ -176,6 +176,27 @@ test("resolveModel only accepts catalogued models", () => {
   assert.equal(resolveModel({ name: "GenuinesAI Fast" }).name, DEFAULT_MODEL.name);
 });
 
+test("link posts get no snippet, so the relevance gate still applies", () => {
+  // A placeholder naming the query used to be written into the snippet, which is
+  // the text relevanceScore reads — every link post then cleared MIN_RELEVANCE
+  // regardless of how unrelated its title was.
+  const [post] = parseRedditResults({
+    data: { children: [{ data: {
+      title: "Cat pictures thread",
+      selftext: "",
+      subreddit_name_prefixed: "r/cats",
+      permalink: "/r/cats/comments/xyz/cat_pictures/",
+      created_utc: 1_700_000_000,
+    } }] },
+  });
+
+  assert.equal(post.snippet, "");
+  assert.ok(
+    relevanceScore("quantum computing breakthrough", post.title, post.snippet) < MIN_RELEVANCE,
+    "an unrelated link post must not clear the relevance gate",
+  );
+});
+
 test("public social payload parsers produce safe, clickable sources", () => {
   const reddit = parseRedditResults({
     data: { children: [{ data: {
@@ -185,7 +206,7 @@ test("public social payload parsers produce safe, clickable sources", () => {
       permalink: "/r/artificial/comments/abc/ai_launch/",
       created_utc: 1_700_000_000,
     } }] },
-  }, "AI launch");
+  });
   assert.equal(reddit[0].source, "Reddit · r/artificial");
   assert.match(reddit[0].url, /^https:\/\/www\.reddit\.com\//);
 

@@ -290,7 +290,7 @@ function socialQuery(prompt: string): string {
 }
 
 /** Converts Reddit's public search payload into the same source shape as news. */
-export function parseRedditResults(payload: RedditPayload, query: string): SearchSource[] {
+export function parseRedditResults(payload: RedditPayload): SearchSource[] {
   return (payload.data?.children ?? []).flatMap((child): SearchSource[] => {
     const post = child.data;
     if (!post) return [];
@@ -304,7 +304,9 @@ export function parseRedditResults(payload: RedditPayload, query: string): Searc
     return [{
       title,
       url: `https://www.reddit.com${permalink}`,
-      snippet: truncateOnWord(cleanText(post.selftext || `Public discussion matching “${query}”.`), 280),
+      // Link posts carry no body. An empty snippet keeps relevance scoring honest;
+      // a placeholder naming the query would echo it back into the filter below.
+      snippet: truncateOnWord(cleanText(post.selftext ?? ""), 280),
       source: `Reddit${post.subreddit_name_prefixed ? ` · ${post.subreddit_name_prefixed}` : ""}`,
       publishedAt,
     }];
@@ -372,7 +374,7 @@ export async function searchSocialMedia(prompt: string, limit: number): Promise<
   mastodonUrl.searchParams.set("resolve", "false");
 
   const responses = await Promise.allSettled([
-    fetchJson(redditUrl, 7000, "Reddit search").then((payload) => parseRedditResults(payload as RedditPayload, query)),
+    fetchJson(redditUrl, 7000, "Reddit search").then((payload) => parseRedditResults(payload as RedditPayload)),
     fetchJson(blueskyUrl, 7000, "Bluesky search").then((payload) => parseBlueskyResults(payload as BlueskyPayload, query)),
     fetchJson(mastodonUrl, 7000, "Mastodon search").then((payload) => parseMastodonResults(payload as MastodonPayload, query)),
   ]);
