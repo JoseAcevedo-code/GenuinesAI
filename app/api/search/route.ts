@@ -3,6 +3,7 @@ import { localResponse } from "../../../lib/search/conversation.ts";
 import {
   MAX_PROMPT_LENGTH,
   SEARCH_INTENT,
+  SOCIAL_INTENT,
   hasNewsIntent,
   resolveFollowUp,
   sanitizedHistory,
@@ -10,6 +11,7 @@ import {
 } from "../../../lib/search/intent.ts";
 import {
   searchNews,
+  searchSocialMedia,
   searchWikipedia,
   wikipediaSummary,
   type SearchSource,
@@ -69,6 +71,7 @@ export async function POST(request: Request) {
 
     const resultLimit = model.resultLimit;
     const newsIntent = hasNewsIntent(resolved.prompt);
+    const socialIntent = SOCIAL_INTENT.test(resolved.prompt);
     const explicitSearch = SEARCH_INTENT.test(resolved.prompt);
 
     // No intent pattern matched. Previously this returned a canned "tell me
@@ -77,9 +80,18 @@ export async function POST(request: Request) {
     // refused before a single source was read. Attempting the search and
     // reporting an honest miss is strictly more useful than refusing to look.
     let sources: SearchSource[] = [];
-    let mode: "news" | "knowledge" = newsIntent ? "news" : "knowledge";
+    let mode: "news" | "knowledge" | "social" = socialIntent ? "social" : newsIntent ? "news" : "knowledge";
 
-    if (newsIntent) {
+    if (socialIntent) {
+      try {
+        sources = await searchSocialMedia(resolved.prompt, resultLimit);
+      } catch (error) {
+        console.error("[search] social lookup failed:", error);
+        sources = [];
+      }
+    }
+
+    if (!socialIntent && newsIntent) {
       try {
         sources = await searchNews(resolved.prompt, resultLimit);
       } catch (error) {
@@ -116,7 +128,9 @@ export async function POST(request: Request) {
     const topic = topicFromNewsPrompt(resolved.prompt);
     const lead = sources[0];
     const summary = mode === "knowledge" ? await wikipediaSummary(lead.key) : "";
-    const answer = mode === "news"
+    const answer = mode === "social"
+      ? `I searched public social conversations about “${topic || resolved.prompt}”. These posts show what people are saying, but they are not verified evidence on their own, so open the sources and cross-check important claims.`
+      : mode === "news"
       ? `${topic ? `I searched current coverage for “${topic}”.` : "I searched current top stories."} Here are the strongest live matches I found, starting with ${lead.source}. Open any source to read the full report.`
       : summary
         ? `${summary} I included the closest live references below so you can verify the information and explore further.`

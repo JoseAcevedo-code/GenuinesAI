@@ -7,7 +7,7 @@
 export const SITE_NAME = "GenuinesAI";
 export const SITE_TAGLINE = "Thoughtful answers. Clearer thinking.";
 export const SITE_DESCRIPTION =
-  "A thoughtful AI conversation experience for clearer thinking, useful answers, and focused action.";
+  "A genuine AI thinking partner with live web and social research, cited answers, file understanding, and saved conversations.";
 export const SITE_URL = "https://genuines-ai.acevedo-jose20188.chatgpt.site";
 export const OWNER_NAME = "Jose";
 

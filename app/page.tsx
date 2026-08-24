@@ -5,8 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { OWNER_NAME, SITE_NAME, SITE_TAGLINE } from "../lib/branding.ts";
 import { DEFAULT_MODEL, MODELS, isKnownModel } from "../lib/models.ts";
 import { STORAGE_KEYS, STORAGE_VERSION } from "../lib/storage.ts";
-import { localResponse } from "../lib/search/conversation.ts";
-import type { HistoryItem } from "../lib/search/intent.ts";
+import type { AnswerCitation } from "../lib/ai/openai.ts";
 
 type SearchSource = {
   title: string;
@@ -23,8 +22,30 @@ type Message = {
   time: string;
   attachment?: string;
   sources?: SearchSource[];
-  searchMode?: "news" | "knowledge" | "conversation" | "error";
+  citations?: AnswerCitation[];
+  searchMode?: "news" | "knowledge" | "web" | "social" | "file" | "conversation" | "error";
   searchedAt?: string;
+};
+
+type SavedConversation = {
+  id: string;
+  title: string;
+  createdAt: number;
+  updatedAt: number;
+  messageCount: number;
+  preview: string;
+};
+
+type SessionState = {
+  authenticated: boolean;
+  user: { displayName: string; email: string; fullName: string | null } | null;
+  capabilities: {
+    ai: boolean;
+    savedConversations: boolean;
+    fileStorage: boolean;
+    webSearch: boolean;
+    socialSearch: boolean;
+  };
 };
 
 type SpeechRecognitionHandle = {
@@ -49,21 +70,11 @@ declare global {
 const MAX_PERSISTED_MESSAGES = 60;
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 const HISTORY_TURNS_SENT = 10;
+const SUPPORTED_FILE_TYPES = ".pdf,.txt,.md,.csv,.json,.html,.xml,.doc,.docx,.rtf,.odt,.ppt,.pptx,.xls,.xlsx,.png,.jpg,.jpeg,.webp,.gif";
 /** Minimum time the splash stays up, so a fast restore isn't a one-frame flash. */
 const SPLASH_HOLD_MS = 550;
 /** Must match the .app-splash.is-leaving transition duration in globals.css. */
 const SPLASH_FADE_MS = 420;
-
-const sampleChats: Record<string, Message[]> = {
-  "Learning plan ideas": [
-    { id: "sample-101", role: "user", content: "Help me build a learning plan for coding on Android.", time: "Yesterday" },
-    { id: "sample-102", role: "assistant", content: "Start with Python fundamentals in short daily sessions, then build small projects directly in Termux. A good first month would cover syntax, functions, files, APIs, and one finished project you can share.", time: "Yesterday" },
-  ],
-  "Weekly goals": [
-    { id: "sample-201", role: "user", content: "Can you help me set three realistic goals for this week?", time: "Monday" },
-    { id: "sample-202", role: "assistant", content: "Yes. Let’s choose one goal for progress, one for your health, and one for your personal life. Each should be small enough to finish and specific enough to track.", time: "Monday" },
-  ],
-};
 
 const suggestions = [
   {
@@ -73,10 +84,10 @@ const suggestions = [
     prompt: "Look into today’s top news.",
   },
   {
-    icon: "book",
-    title: "Explain a concept",
-    detail: "Make something click",
-    prompt: "Explain a difficult concept to me in a simple way.",
+    icon: "at",
+    title: "Social pulse",
+    detail: "See what people are saying",
+    prompt: "Search public social media discussions about today’s biggest AI topic and separate reactions from verified facts.",
   },
   {
     icon: "spark",
@@ -85,10 +96,10 @@ const suggestions = [
     prompt: "Help me plan a productive day with clear priorities.",
   },
   {
-    icon: "bulb",
-    title: "Brainstorm ideas",
-    detail: "Find a fresh direction",
-    prompt: "Help me brainstorm a few strong ideas for a new project.",
+    icon: "document",
+    title: "Analyze a file",
+    detail: "PDFs, documents and images",
+    prompt: "I’m going to attach a file. Help me understand its key points.",
   },
 ];
 
@@ -125,8 +136,11 @@ function Icon({ name, size = 20 }: { name: string; size?: number }) {
     spark: <><path d="m12 3 1.25 4.1L17 9l-3.75 1.9L12 15l-1.25-4.1L7 9l3.75-1.9L12 3Z" /><path d="m5 14 .7 2.3L8 17.5l-2.3 1.2L5 21l-.7-2.3L2 17.5l2.3-1.2L5 14ZM19 13l.45 1.55L21 15l-1.55.45L19 17l-.45-1.55L17 15l1.55-.45L19 13Z" /></>,
     book: <><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H11v16H6.5A2.5 2.5 0 0 0 4 21.5v-16ZM20 5.5A2.5 2.5 0 0 0 17.5 3H13v16h4.5a2.5 2.5 0 0 1 2.5 2.5v-16Z" /></>,
     document: <><path d="M6 3h8l4 4v14H6V3Z" /><path d="M14 3v5h5M9 13h6M9 17h6" /></>,
+    at: <><circle cx="12" cy="12" r="4" /><path d="M16 8v5a3 3 0 0 0 6 0v-1a10 10 0 1 0-4 8" /></>,
     bulb: <><path d="M9 18h6M10 22h4M8.2 14.5a6 6 0 1 1 7.6 0c-.9.67-1.3 1.55-1.3 2.5h-5c0-.95-.4-1.83-1.3-2.5Z" /></>,
     chat: <path d="M20 15a3 3 0 0 1-3 3H9l-5 3v-6a3 3 0 0 1-1-2.24V7a3 3 0 0 1 3-3h11a3 3 0 0 1 3 3v8Z" />,
+    trash: <><path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13M10 11v5M14 11v5" /></>,
+    cloud: <><path d="M17.5 19H7a5 5 0 0 1-.7-9.95A6 6 0 0 1 18 10.5 4.25 4.25 0 0 1 17.5 19Z" /><path d="m9 14 2 2 4-4" /></>,
     stop: <rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor" stroke="none" />,
   };
 
@@ -161,6 +175,56 @@ function formatSourceDate(value?: string) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "";
   return date.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+}
+
+function formatConversationDate(value: number) {
+  const date = new Date(value);
+  const today = new Date();
+  if (date.toDateString() === today.toDateString()) {
+    return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  }
+  return date.toLocaleDateString([], { month: "short", day: "numeric" });
+}
+
+function displayFirstName(value?: string | null) {
+  return value?.trim().split(/\s+/)[0] || OWNER_NAME;
+}
+
+function initials(value?: string | null) {
+  const parts = value?.trim().split(/\s+/).filter(Boolean) ?? [];
+  return (parts.length > 1 ? `${parts[0][0]}${parts.at(-1)?.[0] ?? ""}` : parts[0]?.slice(0, 2) || "J").toUpperCase();
+}
+
+function AnswerText({ message }: { message: Message }) {
+  const citations = (message.citations ?? [])
+    .filter((citation) => citation.endIndex > 0 && citation.endIndex <= message.content.length)
+    .sort((a, b) => a.endIndex - b.endIndex)
+    .filter((citation, index, all) => index === 0 || citation.url !== all[index - 1].url || citation.endIndex !== all[index - 1].endIndex);
+  if (!citations.length) return <span className="answer-text">{message.content}</span>;
+
+  const nodes: React.ReactNode[] = [];
+  let cursor = 0;
+  citations.forEach((citation, index) => {
+    if (citation.endIndex < cursor) return;
+    nodes.push(message.content.slice(cursor, citation.endIndex));
+    const sourceIndex = message.sources?.findIndex((source) => source.url === citation.url) ?? -1;
+    nodes.push(
+      <a
+        key={`${citation.url}-${citation.endIndex}`}
+        className="inline-citation"
+        href={citation.url}
+        target="_blank"
+        rel="noreferrer"
+        aria-label={`Open citation: ${citation.title}`}
+        title={citation.title}
+      >
+        {sourceIndex >= 0 ? sourceIndex + 1 : index + 1}
+      </a>,
+    );
+    cursor = citation.endIndex;
+  });
+  nodes.push(message.content.slice(cursor));
+  return <span className="answer-text">{nodes}</span>;
 }
 
 /** Monotonic, collision-free message ids. `Date.now()` repeated within a tick. */
@@ -214,22 +278,18 @@ function truncateLabel(value: string, maxLength: number): string {
   return collapsed.length > maxLength ? `${collapsed.slice(0, maxLength - 1).trimEnd()}…` : collapsed;
 }
 
-function toHistoryItems(messages: Message[]): HistoryItem[] {
-  return messages.map((message) => ({ role: message.role, content: message.content }));
-}
-
 /**
  * The API can be unreachable for reasons that have nothing to do with this app
  * — a gateway rejecting the POST, an expired hosting session, an outage. Say
  * what still works instead of showing a bare status code.
  */
-function searchUnavailableMessage(status: number): string {
+function chatUnavailableMessage(status: number): string {
   const reason = status === 401 || status === 403
-    ? `Live search is turning me away right now (${status}), which usually means the hosting layer is blocking the request rather than anything you did.`
+    ? "This conversation needs you to sign in again."
     : status === 429
-      ? "I’m being rate limited at the moment."
-      : `Live search isn’t responding right now (${status}).`;
-  return `${reason} I can still help directly: ask me to explain something, plan your day, brainstorm, draft text, or work through a coding problem.`;
+      ? "I’m receiving too many requests at once."
+      : "The AI service isn’t responding right now.";
+  return `${reason} Please wait a moment and try again.`;
 }
 
 function currentTime(): string {
@@ -239,6 +299,11 @@ function currentTime(): string {
 export default function Home() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
+  const [session, setSession] = useState<SessionState | null>(null);
+  const [savedConversations, setSavedConversations] = useState<SavedConversation[]>([]);
+  const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
+  const [conversationLoading, setConversationLoading] = useState(false);
+  const [aiSetupNeeded, setAiSetupNeeded] = useState(false);
   const [input, setInput] = useState("");
   const [isTyping, setIsTyping] = useState(false);
   /**
@@ -248,6 +313,7 @@ export default function Home() {
    * make in a product whose pitch is that it shows you its sources.
    */
   const [isSearching, setIsSearching] = useState(false);
+  const [requestLabel, setRequestLabel] = useState("Thinking");
 
   /** Newest assistant reply, announced by the live region below. */
   const latestAssistantText = useMemo(() => {
@@ -396,85 +462,171 @@ export default function Home() {
     }, 2200);
   }, []);
 
+  const refreshSavedConversations = useCallback(async () => {
+    try {
+      const response = await fetch("/api/conversations", { headers: { Accept: "application/json" } });
+      if (!response.ok) {
+        if (response.status === 401) setSavedConversations([]);
+        return;
+      }
+      const data = await response.json() as { conversations?: SavedConversation[] };
+      setSavedConversations(Array.isArray(data.conversations) ? data.conversations : []);
+    } catch {
+      // Local history still keeps the current conversation usable offline.
+    }
+  }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void (async () => {
+      try {
+        const response = await fetch("/api/session", { signal: controller.signal, headers: { Accept: "application/json" } });
+        if (!response.ok) return;
+        const data = await response.json() as SessionState;
+        if (controller.signal.aborted) return;
+        setSession(data);
+        setAiSetupNeeded(!data.capabilities.ai);
+        if (data.authenticated && data.capabilities.savedConversations) await refreshSavedConversations();
+      } catch (error) {
+        if (!(error instanceof DOMException && error.name === "AbortError")) setSession(null);
+      }
+    })();
+    return () => controller.abort();
+  }, [refreshSavedConversations]);
+
   const stopGenerating = () => {
     requestControllerRef.current?.abort();
     requestControllerRef.current = null;
     setIsTyping(false);
+    setIsSearching(false);
   };
 
   const startNewChat = () => {
     stopGenerating();
     removeStoredValue(STORAGE_KEYS.messages);
     setMessages([]);
+    setActiveConversationId(null);
     setInput("");
     setAttachedFile(null);
     setSidebarOpen(false);
   };
 
-  const loadConversation = (name: keyof typeof sampleChats) => {
+  const loadConversation = async (id: string) => {
     stopGenerating();
-    setMessages(sampleChats[name]);
+    setConversationLoading(true);
     setSidebarOpen(false);
+    try {
+      const response = await fetch(`/api/conversations/${encodeURIComponent(id)}`, { headers: { Accept: "application/json" } });
+      const data = await response.json().catch(() => ({})) as {
+        error?: string;
+        messages?: Array<{
+          id: string;
+          role: "user" | "assistant";
+          content: string;
+          model?: string;
+          sources?: SearchSource[];
+          citations?: AnswerCitation[];
+          attachment?: string;
+          createdAt: number;
+        }>;
+      };
+      if (!response.ok) throw new Error(data.error || "Conversation couldn’t be loaded");
+      setMessages((data.messages ?? []).map((message) => ({
+        id: message.id,
+        role: message.role,
+        content: message.content,
+        time: new Date(message.createdAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }),
+        attachment: message.attachment,
+        sources: message.sources,
+        citations: message.citations,
+        searchMode: message.sources?.length ? "web" : "conversation",
+      })));
+      setActiveConversationId(id);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : "Conversation couldn’t be loaded");
+    } finally {
+      setConversationLoading(false);
+    }
   };
 
-  const requestAssistant = async (prompt: string, history: Message[], attachmentName?: string) => {
+  const deleteSavedConversation = async (id: string) => {
+    try {
+      const response = await fetch(`/api/conversations/${encodeURIComponent(id)}`, { method: "DELETE" });
+      if (!response.ok) throw new Error("Conversation couldn’t be deleted");
+      if (activeConversationId === id) startNewChat();
+      setSavedConversations((current) => current.filter((conversation) => conversation.id !== id));
+      showToast("Conversation deleted");
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : "Conversation couldn’t be deleted");
+    }
+  };
+
+  const requestAssistant = async (prompt: string, history: Message[], attachment?: File) => {
     requestControllerRef.current?.abort();
     const controller = new AbortController();
     requestControllerRef.current = controller;
     setIsTyping(true);
+    const searchLike = /\b(today|latest|current|news|search|look up|social|reddit|bluesky|twitter|tiktok|instagram|threads|youtube|what happened|people saying)\b/i.test(prompt);
+    setIsSearching(searchLike);
+    setRequestLabel(attachment
+      ? "Reading your file"
+      : /\b(social|reddit|bluesky|twitter|tiktok|instagram|threads|youtube|people saying)\b/i.test(prompt)
+        ? "Searching web + social"
+        : searchLike
+          ? "Searching the live web"
+          : `${selectedModel.replace(`${SITE_NAME} `, "")} is thinking`);
 
     try {
-      let data: {
+      const requestHistory = history.slice(-HISTORY_TURNS_SENT).map((message) => ({
+        role: message.role,
+        content: message.content,
+        sourceTitles: message.sources?.map((source) => source.title).slice(0, 3),
+      }));
+      let body: BodyInit;
+      let headers: HeadersInit | undefined;
+      if (attachment) {
+        const form = new FormData();
+        form.set("query", prompt);
+        form.set("model", selectedModel);
+        form.set("history", JSON.stringify(requestHistory));
+        if (activeConversationId) form.set("conversationId", activeConversationId);
+        form.set("file", attachment);
+        body = form;
+      } else {
+        headers = { "Content-Type": "application/json" };
+        body = JSON.stringify({
+          query: prompt,
+          model: selectedModel,
+          history: requestHistory,
+          conversationId: activeConversationId,
+        });
+      }
+
+      const response = await fetch("/api/chat", {
+        method: "POST",
+        headers,
+        body,
+        signal: controller.signal,
+      });
+      const data = await response.json().catch(() => ({})) as {
         answer?: string;
         error?: string;
         sources?: SearchSource[];
+        citations?: AnswerCitation[];
         mode?: Message["searchMode"];
         searchedAt?: string;
+        configurationRequired?: boolean;
+        conversationId?: string;
+        saved?: boolean;
+        provider?: "openai" | "fallback";
       };
-
-      const offlineAnswer = attachmentName ? null : localResponse(prompt, toHistoryItems(history));
-      setIsSearching(!attachmentName && !offlineAnswer);
-
-      if (attachmentName) {
-        data = {
-          answer: `${attachmentName} is attached to this conversation. File-content analysis is not connected yet, but you can paste the relevant text and I’ll help with it immediately.`,
-          sources: [],
-          mode: "conversation",
-        };
-      } else if (offlineAnswer) {
-        // The rule-based layer is pure and needs no server, so answer from it
-        // here. This is the same module the route runs, so the reply is
-        // identical — it just arrives instantly and keeps working when the API
-        // is unreachable.
-        data = { answer: offlineAnswer, sources: [], mode: "conversation" };
-      } else {
-        const response = await fetch("/api/search", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            query: prompt,
-            model: selectedModel,
-            history: history.slice(-HISTORY_TURNS_SENT).map((message) => ({
-              role: message.role,
-              content: message.content,
-              sourceTitles: message.sources?.map((source) => source.title).slice(0, 3),
-            })),
-          }),
-          signal: controller.signal,
-        });
-        // A gateway error can answer with HTML, so a failed parse must not mask the status.
-        data = await response.json().catch(() => ({})) as typeof data;
-        if (!response.ok) {
-          // 400 and 413 are this app rejecting the input and carry a usable
-          // message; anything else is the search path being unavailable.
-          if (data.error && (response.status === 400 || response.status === 413)) {
-            throw new Error(data.error);
-          }
-          data = { answer: searchUnavailableMessage(response.status), sources: [], mode: "error" };
-        }
+      if (!response.ok) {
+        throw new Error(data.error || chatUnavailableMessage(response.status));
       }
 
       if (controller.signal.aborted) return;
+      setAiSetupNeeded(Boolean(data.configurationRequired));
+      if (data.conversationId) setActiveConversationId(data.conversationId);
       setMessages((current) => [
         ...current,
         {
@@ -483,10 +635,12 @@ export default function Home() {
           content: data.answer || "I couldn’t form a response. Please try that once more.",
           time: currentTime(),
           sources: data.sources,
+          citations: data.citations,
           searchMode: data.mode,
           searchedAt: data.searchedAt,
         },
       ]);
+      if (data.saved) void refreshSavedConversations();
     } catch (error) {
       // An aborted request is a deliberate stop, not a failure to report.
       if (controller.signal.aborted || (error instanceof DOMException && error.name === "AbortError")) return;
@@ -506,6 +660,7 @@ export default function Home() {
       if (requestControllerRef.current === controller) {
         requestControllerRef.current = null;
         setIsTyping(false);
+        setIsSearching(false);
       }
     }
   };
@@ -514,7 +669,8 @@ export default function Home() {
     const cleaned = value.trim() || (attachedFile ? "Please help me with this file." : "");
     if (!cleaned || isTyping) return;
 
-    const attachmentName = attachedFile?.name;
+    const attachment = attachedFile;
+    const attachmentName = attachment?.name;
     const history = messages;
     setMessages((current) => [
       ...current,
@@ -522,7 +678,7 @@ export default function Home() {
     ]);
     setInput("");
     setAttachedFile(null);
-    void requestAssistant(cleaned, history, attachmentName);
+    void requestAssistant(cleaned, history, attachment ?? undefined);
   };
 
   const copyMessage = async (message: Message) => {
@@ -554,9 +710,13 @@ export default function Home() {
     if (lastPromptIndex === -1) return;
 
     const lastPrompt = messages[lastPromptIndex];
+    if (lastPrompt.attachment) {
+      showToast("Attach the file again to reanalyze it");
+      return;
+    }
     const history = messages.slice(0, lastPromptIndex);
     setMessages(messages.slice(0, lastPromptIndex + 1));
-    void requestAssistant(lastPrompt.content, history, lastPrompt.attachment);
+    void requestAssistant(lastPrompt.content, history);
   };
 
   const toggleVoiceInput = () => {
@@ -619,7 +779,7 @@ export default function Home() {
       <aside className={`sidebar ${sidebarOpen ? "is-open" : ""}`} aria-label="Conversation navigation">
         <div className="sidebar-brand">
           <LogoMark className="brand-mark-small" />
-          <span>GenuinesAI</span>
+          <span><strong>GenuinesAI</strong><small>AI · web · social</small></span>
           <button className="icon-button sidebar-close" onClick={() => setSidebarOpen(false)} aria-label="Close menu">
             <Icon name="close" />
           </button>
@@ -632,22 +792,54 @@ export default function Home() {
 
         <nav className="conversation-nav">
           <p className="nav-label">Recent</p>
-          <button className="conversation-link is-active" onClick={() => setSidebarOpen(false)}>
-            <Icon name="chat" size={17} />
-            <span>{messages[0] ? truncateLabel(messages[0].content, 26) : `Getting started with ${SITE_NAME}`}</span>
-          </button>
-          <button className="conversation-link" onClick={() => loadConversation("Learning plan ideas")}><Icon name="chat" size={17} /><span>Learning plan ideas</span></button>
-          <button className="conversation-link" onClick={() => loadConversation("Weekly goals")}><Icon name="chat" size={17} /><span>Weekly goals</span></button>
+          {messages.length > 0 && !activeConversationId && (
+            <button className="conversation-link is-active" onClick={() => setSidebarOpen(false)}>
+              <Icon name="chat" size={17} />
+              <span><strong>{truncateLabel(messages.find((message) => message.role === "user")?.content || "New conversation", 28)}</strong><small>On this device</small></span>
+            </button>
+          )}
+          {savedConversations.map((conversation) => (
+            <div className="conversation-item" key={conversation.id}>
+              <button
+                className={`conversation-link ${activeConversationId === conversation.id ? "is-active" : ""}`}
+                onClick={() => void loadConversation(conversation.id)}
+                disabled={conversationLoading}
+              >
+                <Icon name="chat" size={17} />
+                <span>
+                  <strong>{conversation.title}</strong>
+                  <small>{formatConversationDate(conversation.updatedAt)} · {conversation.messageCount} messages</small>
+                </span>
+              </button>
+              <button className="conversation-delete" onClick={() => void deleteSavedConversation(conversation.id)} aria-label={`Delete ${conversation.title}`}>
+                <Icon name="trash" size={15} />
+              </button>
+            </div>
+          ))}
+          {session?.authenticated && savedConversations.length === 0 && !messages.length && (
+            <p className="nav-empty"><Icon name="cloud" size={15} />Your saved conversations will appear here.</p>
+          )}
+          {session && !session.authenticated && (
+            <a className="nav-signin" href="/signin-with-chatgpt?return_to=%2F"><Icon name="cloud" size={15} />Sign in to sync chats across devices</a>
+          )}
         </nav>
 
         <div className="sidebar-footer">
           <button className="sidebar-action" onClick={() => { setActiveModal("help"); setSidebarOpen(false); }}><Icon name="help" size={18} /><span>Help & shortcuts</span></button>
           <button className="sidebar-action" onClick={() => { setActiveModal("settings"); setSidebarOpen(false); }}><Icon name="settings" size={18} /><span>Settings</span></button>
-          <div className="profile-row">
-            <span className="profile-avatar">J</span>
-            <span className="profile-copy"><strong>{OWNER_NAME}</strong><small>Personal workspace</small></span>
-            <Icon name="chevron" size={17} />
-          </div>
+          {session?.authenticated ? (
+            <div className="profile-row">
+              <span className="profile-avatar">{initials(session.user?.displayName)}</span>
+              <span className="profile-copy"><strong>{session.user?.displayName || OWNER_NAME}</strong><small>Chats saved securely</small></span>
+              <Icon name="cloud" size={17} />
+            </div>
+          ) : (
+            <a className="profile-row" href="/signin-with-chatgpt?return_to=%2F">
+              <span className="profile-avatar">J</span>
+              <span className="profile-copy"><strong>Sign in with ChatGPT</strong><small>Save and sync conversations</small></span>
+              <Icon name="chevron" size={17} />
+            </a>
+          )}
         </div>
       </aside>
 
@@ -692,6 +884,10 @@ export default function Home() {
               </div>
             )}
           </div>
+          <div className={`ai-status-chip ${aiSetupNeeded ? "needs-setup" : ""}`} title={aiSetupNeeded ? "The site owner still needs to connect the AI service" : "Genuine AI responses are connected"}>
+            <span />
+            <strong>{aiSetupNeeded ? "AI setup needed" : "AI connected"}</strong>
+          </div>
           <button className="icon-button new-mobile-chat" onClick={startNewChat} aria-label="Start a new conversation">
             <Icon name="plus" size={22} />
           </button>
@@ -707,9 +903,15 @@ export default function Home() {
           {messages.length === 0 ? (
             <section className="welcome-state">
               <LogoMark className="hero-mark" />
-              <p className="eyebrow">Your thinking partner</p>
-              <h1>Ready when you are, {OWNER_NAME}.</h1>
-              <p className="welcome-copy">Ask a question, search current news, or turn an idea into a clear plan.</p>
+              <p className="eyebrow">Your AI thinking partner</p>
+              <h1>Ready when you are, {displayFirstName(session?.user?.displayName)}.</h1>
+              <p className="welcome-copy">Ask anything, search the live web and public social conversations, or attach a file for analysis.</p>
+              <div className="capability-row" aria-label="Available capabilities">
+                <span><Icon name="spark" size={13} />Genuine AI</span>
+                <span><Icon name="globe" size={13} />Live sources</span>
+                <span><Icon name="at" size={13} />Social pulse</span>
+                <span><Icon name="document" size={13} />File analysis</span>
+              </div>
 
               <div className="suggestion-grid">
                 {suggestions.map((suggestion) => (
@@ -730,19 +932,27 @@ export default function Home() {
                   <div className="message-wrap">
                     <div className="message-bubble">
                       {message.attachment && <span className="attachment-chip"><Icon name="document" size={15} />{message.attachment}</span>}
-                      <span>{message.content}</span>
+                      {message.role === "assistant" ? <AnswerText message={message} /> : <span>{message.content}</span>}
                     </div>
                     {message.role === "assistant" && message.searchMode && message.searchMode !== "conversation" && (
                       <div className={`search-activity ${message.searchMode === "error" ? "has-error" : ""}`}>
                         <Icon name="globe" size={14} />
-                        <span>{message.searchMode === "news" ? "Searched live news" : message.searchMode === "knowledge" ? "Searched live references" : "Search unavailable"}</span>
+                        <span>{message.searchMode === "social"
+                          ? "Searched web + public social"
+                          : message.searchMode === "file"
+                            ? "Analyzed your file"
+                            : message.searchMode === "web" || message.searchMode === "news"
+                              ? "Searched the live web"
+                              : message.searchMode === "knowledge"
+                                ? "Searched live references"
+                                : "Response unavailable"}</span>
                         {message.searchedAt && <time>{formatSourceDate(message.searchedAt)}</time>}
                       </div>
                     )}
                     {message.role === "assistant" && message.sources && message.sources.length > 0 && (
                       <div className="source-list" aria-label="Sources">
                         {message.sources.map((source, index) => (
-                          <a key={`${source.url}-${index}`} className="source-card" href={source.url} target="_blank" rel="noreferrer">
+                          <a key={`${source.url}-${index}`} className={`source-card ${/reddit|bluesky|mastodon|twitter|x\.com|tiktok|instagram|threads|youtube/i.test(`${source.source} ${source.url}`) ? "is-social" : ""}`} href={source.url} target="_blank" rel="noreferrer">
                             <span className="source-number">{index + 1}</span>
                             <span className="source-copy">
                               <strong>{source.title}</strong>
@@ -779,7 +989,7 @@ export default function Home() {
                     <div className="typing-bubble"><span /><span /><span /></div>
                     <small>
                       <Icon name={isSearching ? "globe" : "spark"} size={12} />
-                      {isSearching ? "Searching live sources" : "Thinking"}
+                      {requestLabel}
                     </small>
                   </div>
                 </article>
@@ -796,7 +1006,7 @@ export default function Home() {
         */}
         <div className="visually-hidden" role="status" aria-live="polite" aria-atomic="true">
           {isTyping
-            ? (isSearching ? "Searching live sources" : "Thinking")
+            ? requestLabel
             : latestAssistantText}
         </div>
 
@@ -812,6 +1022,7 @@ export default function Home() {
             ref={fileInputRef}
             className="visually-hidden"
             type="file"
+            accept={SUPPORTED_FILE_TYPES}
             onChange={(event) => {
               const file = event.target.files?.[0];
               if (!file) return;
@@ -821,7 +1032,7 @@ export default function Home() {
                 return;
               }
               setAttachedFile(file);
-              showToast(`${file.name} attached`);
+              showToast(`${file.name} ready to analyze`);
               event.target.value = "";
             }}
           />
@@ -840,7 +1051,7 @@ export default function Home() {
                 }
               }}
               rows={1}
-              placeholder={isListening ? "Listening…" : "Message GenuinesAI"}
+              placeholder={isListening ? "Listening…" : "Ask GenuinesAI anything"}
               aria-label="Message GenuinesAI"
             />
             <button
@@ -860,7 +1071,7 @@ export default function Home() {
               </button>
             )}
           </div>
-          <p className="disclaimer">GenuinesAI can make mistakes. Check important information.</p>
+          <p className="disclaimer">GenuinesAI can make mistakes. Verify important information and cited social claims.</p>
         </footer>
       </section>
 
@@ -896,19 +1107,29 @@ export default function Home() {
                   <span><strong>Current model</strong><small>Your selection is saved automatically.</small></span>
                   <span className="setting-value">{selectedModel.replace(`${SITE_NAME} `, "")}</span>
                 </div>
+                <div className="setting-row ai-engine-setting">
+                  <span><strong>Genuine AI engine</strong><small>OpenAI Responses API with model-specific reasoning.</small></span>
+                  <span className={`setting-value ${aiSetupNeeded ? "needs-setup" : ""}`}><i />{aiSetupNeeded ? "Setup needed" : "Connected"}</span>
+                </div>
                 <div className="setting-row live-search-setting">
-                  <span><strong>Live search</strong><small>Current news and reference sources.</small></span>
+                  <span><strong>Live search</strong><small>Web, news, citations, Reddit, Bluesky and Mastodon.</small></span>
                   <span className="setting-value"><i />Connected</span>
+                </div>
+                <div className="setting-row">
+                  <span><strong>Saved conversations</strong><small>Protected by your ChatGPT identity and stored in the cloud.</small></span>
+                  {session?.authenticated
+                    ? <span className="setting-value"><Icon name="cloud" size={13} />Sync on</span>
+                    : <a className="setting-link" href="/signin-with-chatgpt?return_to=%2F">Sign in</a>}
                 </div>
                 <button className="clear-chat-button" onClick={() => { startNewChat(); setActiveModal(null); showToast("Conversation cleared"); }}>Clear current conversation</button>
               </div>
             ) : (
               <div className="modal-content help-content">
-                <p>GenuinesAI is designed to turn rough thoughts into useful next steps. Start with a quick prompt or write your own message.</p>
+                <p>GenuinesAI combines genuine AI reasoning with live web research, public social discussion, durable chat history, and document understanding.</p>
                 <div className="shortcut-row"><span>Send a message</span><kbd>Enter</kbd></div>
                 <div className="shortcut-row"><span>Add a new line</span><kbd>Shift</kbd><span className="key-plus">+</span><kbd>Enter</kbd></div>
                 <div className="shortcut-row"><span>Start over</span><button onClick={() => { startNewChat(); setActiveModal(null); }}>New conversation</button></div>
-                <p className="help-note">For current information, say “search,” “latest,” “today,” or “news.” GenuinesAI will show the sources it consulted. Voice input depends on browser support.</p>
+                <p className="help-note">Ask for “latest” information to trigger live research, mention a social platform to explore public reactions, or tap the paperclip to analyze a supported file. Social posts are shown as discussion—not automatically treated as verified fact.</p>
               </div>
             )}
           </section>
