@@ -7,7 +7,6 @@
 export const STORAGE_KEYS = {
   version: "genuinesai-data-version",
   messages: "genuinesai-messages",
-  conversationId: "genuinesai-conversation-id",
   model: "genuinesai-model",
   theme: "genuinesai-theme",
 } as const;

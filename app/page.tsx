@@ -308,6 +308,7 @@ export default function Home() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
   const [session, setSession] = useState<SessionState | null>(null);
+  const lastIdentityRef = useRef<string | null>(null);
   const [savedConversations, setSavedConversations] = useState<SavedConversation[]>([]);
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
   const [conversationLoading, setConversationLoading] = useState(false);
@@ -363,7 +364,6 @@ export default function Home() {
   useEffect(() => {
     const storageVersion = readStoredValue(STORAGE_KEYS.version);
     const savedMessages = readStoredValue(STORAGE_KEYS.messages);
-    const savedConversationId = readStoredValue(STORAGE_KEYS.conversationId);
     const savedModel = readStoredValue(STORAGE_KEYS.model);
     const savedTheme = readStoredValue(STORAGE_KEYS.theme);
 
@@ -372,10 +372,8 @@ export default function Home() {
         const parsed = JSON.parse(savedMessages) as unknown;
         // A hand-edited or half-written entry must not take the whole app down.
         const restored = Array.isArray(parsed) ? (parsed as unknown[]).filter(isStoredMessage) : null;
-        if (restored?.length) {
-          setMessages(restored);
-          if (savedConversationId) setActiveConversationId(savedConversationId);
-        } else removeStoredValue(STORAGE_KEYS.messages);
+        if (restored?.length) setMessages(restored);
+        else removeStoredValue(STORAGE_KEYS.messages);
       } catch {
         removeStoredValue(STORAGE_KEYS.messages);
       }
@@ -407,8 +405,8 @@ export default function Home() {
 
   useEffect(() => {
     if (!hydrated) return;
-    writeStoredValue(STORAGE_KEYS.messages, JSON.stringify(messages.slice(-MAX_PERSISTED_MESSAGES)));
-    writeStoredValue(STORAGE_KEYS.conversationId, activeConversationId ?? "");
+    if (activeConversationId) removeStoredValue(STORAGE_KEYS.messages);
+    else writeStoredValue(STORAGE_KEYS.messages, JSON.stringify(messages.slice(-MAX_PERSISTED_MESSAGES)));
     writeStoredValue(STORAGE_KEYS.version, STORAGE_VERSION);
     writeStoredValue(STORAGE_KEYS.model, selectedModel);
     writeStoredValue(STORAGE_KEYS.theme, theme);
@@ -573,6 +571,18 @@ export default function Home() {
       showToast(error instanceof Error ? error.message : "Conversation couldn’t be deleted");
     }
   };
+
+  const signedInEmail = session?.user?.email ?? null;
+  useEffect(() => {
+    const previous = lastIdentityRef.current;
+    lastIdentityRef.current = signedInEmail;
+    // Only a sign-out or an account switch clears; the first resolve of an
+    // anonymous session must not discard a draft typed before it loaded.
+    if (!previous || previous === signedInEmail) return;
+    removeStoredValue(STORAGE_KEYS.messages);
+    setMessages([]);
+    setActiveConversationId(null);
+  }, [signedInEmail]);
 
   const requestAssistant = async (prompt: string, history: Message[], attachment?: File, regenerate = false) => {
     requestControllerRef.current?.abort();
@@ -1134,9 +1144,11 @@ export default function Home() {
                 </div>
                 <div className="setting-row">
                   <span><strong>Saved conversations</strong><small>Protected by your ChatGPT identity and stored in the cloud.</small></span>
-                  {session?.authenticated
-                    ? <span className="setting-value"><Icon name="cloud" size={13} />Sync on</span>
-                    : <a className="setting-link" href="/signin-with-chatgpt?return_to=%2F">Sign in</a>}
+                  {!session?.authenticated
+                    ? <a className="setting-link" href="/signin-with-chatgpt?return_to=%2F">Sign in</a>
+                    : session.capabilities.savedConversations
+                      ? <span className="setting-value"><Icon name="cloud" size={13} />Sync on</span>
+                      : <span className="setting-value">Unavailable</span>}
                 </div>
                 <button className="clear-chat-button" onClick={() => { startNewChat(); setActiveModal(null); showToast("Conversation cleared"); }}>Clear current conversation</button>
               </div>
