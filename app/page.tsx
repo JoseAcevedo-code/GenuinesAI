@@ -234,6 +234,14 @@ function createMessageId(): string {
   return `m${Date.now().toString(36)}-${messageSequence}`;
 }
 
+/** A stored transcript entry is only usable if the fields the UI reads are present. */
+function isStoredMessage(value: unknown): value is Message {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Partial<Message>;
+  return typeof candidate.content === "string"
+    && (candidate.role === "user" || candidate.role === "assistant");
+}
+
 function readStoredValue(key: string): string | null {
   try {
     return window.localStorage.getItem(key);
@@ -300,6 +308,7 @@ export default function Home() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
   const [session, setSession] = useState<SessionState | null>(null);
+  const lastIdentityRef = useRef<string | null>(null);
   const [savedConversations, setSavedConversations] = useState<SavedConversation[]>([]);
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
   const [conversationLoading, setConversationLoading] = useState(false);
@@ -362,7 +371,8 @@ export default function Home() {
       try {
         const parsed = JSON.parse(savedMessages) as unknown;
         // A hand-edited or half-written entry must not take the whole app down.
-        if (Array.isArray(parsed)) setMessages(parsed as Message[]);
+        const restored = Array.isArray(parsed) ? (parsed as unknown[]).filter(isStoredMessage) : null;
+        if (restored?.length) setMessages(restored);
         else removeStoredValue(STORAGE_KEYS.messages);
       } catch {
         removeStoredValue(STORAGE_KEYS.messages);
@@ -395,12 +405,13 @@ export default function Home() {
 
   useEffect(() => {
     if (!hydrated) return;
-    writeStoredValue(STORAGE_KEYS.messages, JSON.stringify(messages.slice(-MAX_PERSISTED_MESSAGES)));
+    if (activeConversationId) removeStoredValue(STORAGE_KEYS.messages);
+    else writeStoredValue(STORAGE_KEYS.messages, JSON.stringify(messages.slice(-MAX_PERSISTED_MESSAGES)));
     writeStoredValue(STORAGE_KEYS.version, STORAGE_VERSION);
     writeStoredValue(STORAGE_KEYS.model, selectedModel);
     writeStoredValue(STORAGE_KEYS.theme, theme);
     document.documentElement.dataset.theme = theme;
-  }, [messages, selectedModel, theme, hydrated]);
+  }, [messages, selectedModel, theme, activeConversationId, hydrated]);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: prefersReducedMotion() ? "auto" : "smooth" });
@@ -561,7 +572,19 @@ export default function Home() {
     }
   };
 
-  const requestAssistant = async (prompt: string, history: Message[], attachment?: File) => {
+  const signedInEmail = session?.user?.email ?? null;
+  useEffect(() => {
+    const previous = lastIdentityRef.current;
+    lastIdentityRef.current = signedInEmail;
+    // Only a sign-out or an account switch clears; the first resolve of an
+    // anonymous session must not discard a draft typed before it loaded.
+    if (!previous || previous === signedInEmail) return;
+    removeStoredValue(STORAGE_KEYS.messages);
+    setMessages([]);
+    setActiveConversationId(null);
+  }, [signedInEmail]);
+
+  const requestAssistant = async (prompt: string, history: Message[], attachment?: File, regenerate = false) => {
     requestControllerRef.current?.abort();
     const controller = new AbortController();
     requestControllerRef.current = controller;
@@ -590,6 +613,7 @@ export default function Home() {
         form.set("model", selectedModel);
         form.set("history", JSON.stringify(requestHistory));
         if (activeConversationId) form.set("conversationId", activeConversationId);
+        if (regenerate) form.set("regenerate", "true");
         form.set("file", attachment);
         body = form;
       } else {
@@ -599,6 +623,7 @@ export default function Home() {
           model: selectedModel,
           history: requestHistory,
           conversationId: activeConversationId,
+          regenerate,
         });
       }
 
@@ -617,10 +642,12 @@ export default function Home() {
         searchedAt?: string;
         configurationRequired?: boolean;
         conversationId?: string;
+        conversationExpired?: boolean;
         saved?: boolean;
         provider?: "openai" | "fallback";
       };
       if (!response.ok) {
+        if (data.conversationExpired) setActiveConversationId(null);
         throw new Error(data.error || chatUnavailableMessage(response.status));
       }
 
@@ -716,7 +743,7 @@ export default function Home() {
     }
     const history = messages.slice(0, lastPromptIndex);
     setMessages(messages.slice(0, lastPromptIndex + 1));
-    void requestAssistant(lastPrompt.content, history);
+    void requestAssistant(lastPrompt.content, history, undefined, true);
   };
 
   const toggleVoiceInput = () => {
@@ -1117,9 +1144,11 @@ export default function Home() {
                 </div>
                 <div className="setting-row">
                   <span><strong>Saved conversations</strong><small>Protected by your ChatGPT identity and stored in the cloud.</small></span>
-                  {session?.authenticated
-                    ? <span className="setting-value"><Icon name="cloud" size={13} />Sync on</span>
-                    : <a className="setting-link" href="/signin-with-chatgpt?return_to=%2F">Sign in</a>}
+                  {!session?.authenticated
+                    ? <a className="setting-link" href="/signin-with-chatgpt?return_to=%2F">Sign in</a>
+                    : session.capabilities.savedConversations
+                      ? <span className="setting-value"><Icon name="cloud" size={13} />Sync on</span>
+                      : <span className="setting-value">Unavailable</span>}
                 </div>
                 <button className="clear-chat-button" onClick={() => { startNewChat(); setActiveModal(null); showToast("Conversation cleared"); }}>Clear current conversation</button>
               </div>

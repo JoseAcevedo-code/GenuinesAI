@@ -13,11 +13,11 @@ import {
   getOwnedConversation,
   hasDatabase,
   saveAttachmentMetadata,
+  dropLastExchange,
   saveExchange,
 } from "../../../lib/persistence/conversations.ts";
 import { localResponse } from "../../../lib/search/conversation.ts";
 import {
-  MAX_PROMPT_LENGTH,
   SEARCH_INTENT,
   SOCIAL_INTENT,
   hasNewsIntent,
@@ -64,6 +64,7 @@ type ParsedRequest = {
   model: unknown;
   history: ReturnType<typeof sanitizedHistory>;
   conversationId?: string;
+  regenerate: boolean;
   file?: File;
 };
 
@@ -92,6 +93,13 @@ function parseHistory(value: unknown) {
   }
 }
 
+/**
+ * Chat prompts are prose, not search queries: MAX_PROMPT_LENGTH (500) is far too
+ * small. Over-long input is rejected rather than truncated — a silently clipped
+ * prompt produces an answer to a question the user did not ask.
+ */
+const MAX_CHAT_PROMPT_LENGTH = 8000;
+
 async function parseRequest(request: Request): Promise<ParsedRequest> {
   const contentType = request.headers.get("content-type") ?? "";
   if (contentType.includes("multipart/form-data")) {
@@ -100,10 +108,11 @@ async function parseRequest(request: Request): Promise<ParsedRequest> {
     const fileEntry = form.get("file");
     const conversationId = form.get("conversationId");
     return {
-      prompt: typeof query === "string" ? query.trim().slice(0, MAX_PROMPT_LENGTH) : "",
+      prompt: typeof query === "string" ? query.trim() : "",
       model: form.get("model"),
       history: parseHistory(form.get("history")),
       conversationId: typeof conversationId === "string" && conversationId ? conversationId : undefined,
+      regenerate: form.get("regenerate") === "true",
       file: fileEntry instanceof File && fileEntry.size > 0 ? fileEntry : undefined,
     };
   }
@@ -113,12 +122,14 @@ async function parseRequest(request: Request): Promise<ParsedRequest> {
     model?: unknown;
     history?: unknown;
     conversationId?: unknown;
+    regenerate?: unknown;
   };
   return {
-    prompt: typeof body.query === "string" ? body.query.trim().slice(0, MAX_PROMPT_LENGTH) : "",
+    prompt: typeof body.query === "string" ? body.query.trim() : "",
     model: body.model,
     history: sanitizedHistory(body.history),
     conversationId: typeof body.conversationId === "string" && body.conversationId ? body.conversationId : undefined,
+    regenerate: body.regenerate === true,
   };
 }
 
@@ -209,6 +220,10 @@ export async function POST(request: Request) {
   try {
     const parsed = await parseRequest(request);
     if (!parsed.prompt) return json({ error: "Enter a message to continue." }, { status: 400 });
+    if (parsed.prompt.length > MAX_CHAT_PROMPT_LENGTH) return json(
+      { error: `That message is too long. Keep it under ${MAX_CHAT_PROMPT_LENGTH.toLocaleString()} characters.` },
+      { status: 400 },
+    );
     const fileMetadata = validateFile(parsed.file);
     const fileBytes = parsed.file ? new Uint8Array(await parsed.file.arrayBuffer()) : undefined;
     const fileInput: AiFileInput | undefined = parsed.file && fileMetadata && fileBytes
@@ -225,6 +240,16 @@ export async function POST(request: Request) {
         })
       : [];
 
+    const user = await getChatGPTUser();
+    const persistenceReady = Boolean(user) && hasDatabase();
+    if (parsed.conversationId && persistenceReady && user) {
+      const owned = await getOwnedConversation(user.email, parsed.conversationId);
+      if (!owned) return json(
+        { error: "That saved conversation no longer exists.", conversationExpired: true },
+        { status: 404 },
+      );
+    }
+
     const apiKey = typeof env.OPENAI_API_KEY === "string" ? env.OPENAI_API_KEY.trim() : "";
     const aiResult = apiKey
       ? await createOpenAIResponse({
@@ -240,16 +265,18 @@ export async function POST(request: Request) {
       : await fallbackResponse(parsed.prompt, parsed.history, model.resultLimit, Boolean(fileInput));
 
     const sources = dedupeSources([...aiResult.sources, ...socialSources]).slice(0, model.resultLimit);
-    const user = await getChatGPTUser();
     let conversationId = parsed.conversationId;
     let saved = false;
 
-    if (user && hasDatabase()) {
-      if (conversationId) {
-        const owned = await getOwnedConversation(user.email, conversationId);
-        if (!owned) return json({ error: "That saved conversation no longer exists." }, { status: 404 });
-      } else {
+    if (persistenceReady && user) {
+      if (!conversationId) {
         conversationId = (await createConversation(user.email, parsed.prompt)).id;
+      }
+
+      // Regeneration replaces the previous answer; without this the saved
+      // transcript grows a duplicate prompt/answer pair on every retry.
+      if (parsed.regenerate && parsed.conversationId === conversationId) {
+        await dropLastExchange(user.email, conversationId);
       }
 
       const ids = await saveExchange({
@@ -265,20 +292,26 @@ export async function POST(request: Request) {
       saved = true;
 
       if (fileInput && env.BUCKET) {
-        const objectKey = `users/${await ownerObjectPrefix(user.email)}/conversations/${conversationId}/${crypto.randomUUID()}-${fileMetadata?.name ?? "upload"}`;
-        await env.BUCKET.put(objectKey, fileInput.bytes, {
-          httpMetadata: { contentType: fileInput.type },
-          customMetadata: { conversationId, messageId: ids.userMessageId },
-        });
-        await saveAttachmentMetadata({
-          ownerEmail: user.email,
-          conversationId,
-          messageId: ids.userMessageId,
-          filename: fileInput.name,
-          contentType: fileInput.type,
-          size: fileInput.bytes.byteLength,
-          objectKey,
-        });
+        try {
+          const objectKey = `users/${await ownerObjectPrefix(user.email)}/conversations/${conversationId}/${crypto.randomUUID()}-${fileMetadata?.name ?? "upload"}`;
+          await env.BUCKET.put(objectKey, fileInput.bytes, {
+            httpMetadata: { contentType: fileInput.type },
+            customMetadata: { conversationId, messageId: ids.userMessageId },
+          });
+          await saveAttachmentMetadata({
+            ownerEmail: user.email,
+            conversationId,
+            messageId: ids.userMessageId,
+            filename: fileInput.name,
+            contentType: fileInput.type,
+            size: fileInput.bytes.byteLength,
+            objectKey,
+          });
+        } catch (error) {
+          // The answer is already saved. Losing the stored copy of the upload is
+          // not worth making the user pay for the model call twice.
+          console.error("[chat] attachment storage failed:", error);
+        }
       }
     }
 
